@@ -9,7 +9,7 @@ mod req;
 mod res;
 
 pub use method::Method;
-pub use req::{ParseError, Req};
+pub use req::{BodyError, MAX_BODY_SIZE, ParseError, Req};
 pub use res::Res;
 
 type Handler = fn(Req) -> Res;
@@ -56,12 +56,17 @@ impl Sargami {
         }
     }
 
-    fn handle_connection(&self, mut stream: TcpStream) {
-        let mut request_lines = Vec::new();
-        for line in BufReader::new(&stream).lines() {
-            match line {
-                Ok(line) if line.is_empty() => break,
-                Ok(line) => request_lines.push(line),
+    fn handle_connection(&self, stream: TcpStream) {
+        let mut reader = BufReader::new(&stream);
+
+        // Read the request line and headers, up to and including the blank line.
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) if line == "\r\n" || line == "\n" => break,
+                Ok(_) => head.push_str(&line),
                 Err(e) => {
                     eprintln!("Error reading request: {}", e);
                     return;
@@ -71,30 +76,42 @@ impl Sargami {
 
         // A client that connected and hung up without sending anything is not
         // an error: browsers open speculative connections like this all the time.
-        if request_lines.is_empty() {
+        if head.is_empty() {
             return;
         }
 
-        let req = match Req::parse(&request_lines.join("\n")) {
+        let mut req = match Req::parse(&head) {
             Ok(req) => req,
             Err(e) => {
                 eprintln!("Bad request: {}", e);
-                send(&mut stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                send(&stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
                 return;
             }
         };
 
+        // The body follows the blank line. It has to come from the same buffered
+        // reader, which may already be holding some of its bytes.
+        if let Err(e) = req.read_body(&mut reader) {
+            eprintln!("Bad request: {}", e);
+            if matches!(e, BodyError::TooLarge(_)) {
+                send(&stream, b"HTTP/1.1 413 Payload Too Large\r\n\r\n");
+            } else {
+                send(&stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            }
+            return;
+        }
+
         let method = match Method::from_str(&req.method) {
             Some(m) => m,
             None => {
-                send(&mut stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                send(&stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
                 return;
             }
         };
 
         match self.handle_request(method, &req.path, &req) {
-            Ok(res) => send(&mut stream, res.to_string().as_bytes()),
-            Err(_) => send(&mut stream, b"HTTP/1.1 404 Not Found\r\n\r\n"),
+            Ok(res) => send(&stream, res.to_string().as_bytes()),
+            Err(_) => send(&stream, b"HTTP/1.1 404 Not Found\r\n\r\n"),
         }
     }
 
@@ -113,7 +130,7 @@ impl Sargami {
 
 /// Write a response to the client. A client that has already hung up must not
 /// take the server down with it, so write errors are logged, not unwrapped.
-fn send(stream: &mut TcpStream, bytes: &[u8]) {
+fn send(mut stream: &TcpStream, bytes: &[u8]) {
     if let Err(e) = stream.write_all(bytes).and_then(|_| stream.flush()) {
         eprintln!("Error sending response: {}", e);
     }
@@ -198,5 +215,34 @@ mod tests {
         let mut status_line = String::new();
         BufReader::new(&stream).read_line(&mut status_line).unwrap();
         status_line
+    }
+
+    #[test]
+    fn post_body_reaches_the_handler() {
+        thread::spawn(|| {
+            let mut app = Sargami::new();
+            app.post("/echo", |req| Res::ok().with_body(req.body.unwrap_or_default()));
+            app.listen("127.0.0.1:7880");
+        });
+
+        // Sleep to ensure server is ready
+        thread::sleep(Duration::from_millis(100));
+
+        let request = concat!(
+            "POST /echo HTTP/1.1\r\n",
+            "Host: localhost\r\n",
+            "Content-Length: 11\r\n",
+            "\r\n",
+            "hello world"
+        );
+        let mut stream = TcpStream::connect("127.0.0.1:7880").unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        assert!(response.ends_with("\r\n\r\nhello world"), "got: {response}");
     }
 }
