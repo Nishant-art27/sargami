@@ -2,5 +2,8 @@
 name = "sargami"
 version = "0.1.0"
 edition = "2024"
+description = "A zero-dependency HTTP/1.1 micro-framework with an Express-style API"
+license = "MIT"
+repository = "https://github.com/Nishant-art27/sargami"
 
 [dependencies]

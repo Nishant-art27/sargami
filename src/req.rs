@@ -22,9 +22,9 @@ impl fmt::Display for ParseError {
         match self {
             ParseError::Empty => write!(f, "empty request"),
             ParseError::MalformedRequestLine(line) => {
-                write!(f, "malformed request line: {:?}", line)
+                write!(f, "malformed request line: {line:?}")
             }
-            ParseError::MalformedHeader(line) => write!(f, "malformed header: {:?}", line),
+            ParseError::MalformedHeader(line) => write!(f, "malformed header: {line:?}"),
         }
     }
 }
@@ -45,11 +45,11 @@ pub enum BodyError {
 impl fmt::Display for BodyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BodyError::BadContentLength(raw) => write!(f, "invalid Content-Length: {:?}", raw),
+            BodyError::BadContentLength(raw) => write!(f, "invalid Content-Length: {raw:?}"),
             BodyError::TooLarge(len) => {
-                write!(f, "body of {} bytes exceeds the {} byte limit", len, MAX_BODY_SIZE)
+                write!(f, "body of {len} bytes exceeds the {MAX_BODY_SIZE} byte limit")
             }
-            BodyError::Io(e) => write!(f, "could not read body: {}", e),
+            BodyError::Io(e) => write!(f, "could not read body: {e}"),
         }
     }
 }

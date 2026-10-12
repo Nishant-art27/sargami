@@ -1,49 +1,17 @@
 use sargami::{Res, Sargami};
 
-fn main() {
+fn main() -> std::io::Result<()> {
     let mut server = Sargami::new();
-    server.get("/", |req| {
-        println!("Req: {:?}", req);
-        Res {
-            status_code: 200,
-            headers: vec![],
-            body: "Hello, world get!".to_string(),
-            status_text: "OK".to_string(),
-        }
-    });
 
-    server.post("/", |req| {
-        println!("Req: {:?}", req);
-        Res {
-            status_code: 200,
-            headers: vec![],
-            body: "Hello, world post!".to_string(),
-            status_text: "OK".to_string(),
-        }
-    });
+    server
+        .get("/", |_| Res::ok().with_body("Hello, world!"))
+        .get("/greet", |req| {
+            let name = req.get_query("name").unwrap_or("stranger");
+            Res::ok().with_body(format!("Hello, {name}!"))
+        })
+        .post("/echo", |req| Res::ok().with_body(req.body.unwrap_or_default()))
+        .put("/", |_| Res::ok().with_body("Hello, world put!"))
+        .delete("/", |_| Res::ok().with_body("Hello, world delete!"));
 
-    server.put("/", |req| {
-        println!("Req: {:?}", req);
-        Res {
-            status_code: 200,
-            headers: vec![],
-            body: "Hello, world put!".to_string(),
-            status_text: "OK".to_string(),
-        }
-    });
-
-    server.delete("/", |req| {
-        println!("Req: {:?}", req);
-        Res {
-            status_code: 200,
-            headers: vec![],
-            body: "Hello, world delete!".to_string(),
-            status_text: "OK".to_string(),
-        }
-    });
-
-    let addr = "127.0.0.1:8080";
-    server.listen(addr);
-
-    println!("Hello, world!");
+    server.listen("127.0.0.1:8080")
 }

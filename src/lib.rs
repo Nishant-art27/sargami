@@ -1,58 +1,98 @@
+//! A zero-dependency HTTP/1.1 micro-framework with an Express-style API.
+//!
+//! ```no_run
+//! use sargami::{Res, Sargami};
+//!
+//! let mut app = Sargami::new();
+//! app.get("/", |_| Res::ok().with_body("hello"))
+//!     .get("/greet", |req| {
+//!         let name = req.get_query("name").unwrap_or("stranger");
+//!         Res::ok().with_body(format!("hello, {name}"))
+//!     });
+//! app.listen("127.0.0.1:8080").unwrap();
+//! ```
+
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
+    thread,
 };
 
 mod method;
 mod req;
 mod res;
 
-pub use method::Method;
+pub use method::{Method, UnknownMethod};
 pub use req::{BodyError, MAX_BODY_SIZE, ParseError, Req};
 pub use res::Res;
 
-type Handler = fn(Req) -> Res;
+/// A request handler: anything callable as `Fn(Req) -> Res` that can be shared
+/// between threads, including closures that capture state.
+pub type Handler = Box<dyn Fn(Req) -> Res + Send + Sync>;
 
+/// The router and server. Register handlers with [`Sargami::get`] and friends,
+/// then call [`Sargami::listen`].
+#[derive(Default)]
 pub struct Sargami {
     routes: HashMap<(Method, String), Handler>,
 }
 
 impl Sargami {
     pub fn new() -> Self {
-        Self {
-            routes: HashMap::new(),
-        }
+        Self::default()
     }
 
-    pub fn get(&mut self, path: &str, handler: Handler) -> Handler {
-        self.routes.insert((Method::Get, path.to_string()), handler);
-        handler
-    }
-
-    pub fn post(&mut self, path: &str, handler: Handler) -> Handler {
+    /// Register `handler` for requests with `method` on exactly `path`.
+    /// Returns `&mut Self` so registrations can be chained.
+    pub fn route<F>(&mut self, method: Method, path: &str, handler: F) -> &mut Self
+    where
+        F: Fn(Req) -> Res + Send + Sync + 'static,
+    {
         self.routes
-            .insert((Method::Post, path.to_string()), handler);
-        handler
+            .insert((method, path.to_string()), Box::new(handler));
+        self
     }
 
-    pub fn put(&mut self, path: &str, handler: Handler) -> Handler {
-        self.routes.insert((Method::Put, path.to_string()), handler);
-        handler
+    pub fn get<F>(&mut self, path: &str, handler: F) -> &mut Self
+    where
+        F: Fn(Req) -> Res + Send + Sync + 'static,
+    {
+        self.route(Method::Get, path, handler)
     }
 
-    pub fn delete(&mut self, path: &str, handler: Handler) -> Handler {
-        self.routes
-            .insert((Method::Delete, path.to_string()), handler);
-        handler
+    pub fn post<F>(&mut self, path: &str, handler: F) -> &mut Self
+    where
+        F: Fn(Req) -> Res + Send + Sync + 'static,
+    {
+        self.route(Method::Post, path, handler)
     }
 
-    fn handle_request(&self, method: Method, path: &str, req: &Req) -> Result<Res, String> {
-        let handler = self.routes.get(&(method, path.to_string()));
+    pub fn put<F>(&mut self, path: &str, handler: F) -> &mut Self
+    where
+        F: Fn(Req) -> Res + Send + Sync + 'static,
+    {
+        self.route(Method::Put, path, handler)
+    }
 
-        match handler {
-            Some(handler) => Ok(handler(req.clone())),
-            None => Err("Not Found".to_string()),
+    pub fn patch<F>(&mut self, path: &str, handler: F) -> &mut Self
+    where
+        F: Fn(Req) -> Res + Send + Sync + 'static,
+    {
+        self.route(Method::Patch, path, handler)
+    }
+
+    pub fn delete<F>(&mut self, path: &str, handler: F) -> &mut Self
+    where
+        F: Fn(Req) -> Res + Send + Sync + 'static,
+    {
+        self.route(Method::Delete, path, handler)
+    }
+
+    fn handle_request(&self, method: Method, req: Req) -> Res {
+        match self.routes.get(&(method, req.path.clone())) {
+            Some(handler) => handler(req),
+            None => Res::not_found(),
         }
     }
 
@@ -68,7 +108,7 @@ impl Sargami {
                 Ok(_) if line == "\r\n" || line == "\n" => break,
                 Ok(_) => head.push_str(&line),
                 Err(e) => {
-                    eprintln!("Error reading request: {}", e);
+                    eprintln!("Error reading request: {e}");
                     return;
                 }
             }
@@ -83,8 +123,8 @@ impl Sargami {
         let mut req = match Req::parse(&head) {
             Ok(req) => req,
             Err(e) => {
-                eprintln!("Bad request: {}", e);
-                send(&stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                eprintln!("Bad request: {e}");
+                send(&stream, &Res::bad_request());
                 return;
             }
         };
@@ -92,141 +132,143 @@ impl Sargami {
         // The body follows the blank line. It has to come from the same buffered
         // reader, which may already be holding some of its bytes.
         if let Err(e) = req.read_body(&mut reader) {
-            eprintln!("Bad request: {}", e);
-            if matches!(e, BodyError::TooLarge(_)) {
-                send(&stream, b"HTTP/1.1 413 Payload Too Large\r\n\r\n");
-            } else {
-                send(&stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
-            }
+            eprintln!("Bad request: {e}");
+            let res = match e {
+                BodyError::TooLarge(_) => Res::payload_too_large(),
+                _ => Res::bad_request(),
+            };
+            send(&stream, &res);
             return;
         }
 
-        let method = match Method::from_str(&req.method) {
-            Some(m) => m,
-            None => {
-                send(&stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
+        let method = match req.method.parse::<Method>() {
+            Ok(method) => method,
+            Err(e) => {
+                eprintln!("Bad request: {e}");
+                send(&stream, &Res::bad_request());
                 return;
             }
         };
 
-        match self.handle_request(method, &req.path, &req) {
-            Ok(res) => send(&stream, res.to_string().as_bytes()),
-            Err(_) => send(&stream, b"HTTP/1.1 404 Not Found\r\n\r\n"),
-        }
+        send(&stream, &self.handle_request(method, req));
     }
 
-    pub fn listen(&self, addr: &str) {
-        let listener = TcpListener::bind(addr).unwrap();
-        println!("Listening on {}", addr);
+    /// Bind to `addr` and serve requests forever, one thread per connection.
+    pub fn listen(&self, addr: &str) -> io::Result<()> {
+        let listener = TcpListener::bind(addr)?;
+        println!("Listening on {addr}");
+        self.serve(listener)
+    }
 
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => self.handle_connection(stream),
-                Err(e) => eprintln!("Error accepting connection: {}", e),
+    /// Serve requests on an already-bound listener forever, one thread per
+    /// connection. Bind to port 0 and read back `local_addr()` first when the
+    /// port must be known before serving, as the tests do.
+    pub fn serve(&self, listener: TcpListener) -> io::Result<()> {
+        thread::scope(|scope| {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        scope.spawn(move || self.handle_connection(stream));
+                    }
+                    Err(e) => eprintln!("Error accepting connection: {e}"),
+                }
             }
-        }
+        });
+        Ok(())
     }
 }
 
 /// Write a response to the client. A client that has already hung up must not
 /// take the server down with it, so write errors are logged, not unwrapped.
-fn send(mut stream: &TcpStream, bytes: &[u8]) {
-    if let Err(e) = stream.write_all(bytes).and_then(|_| stream.flush()) {
-        eprintln!("Error sending response: {}", e);
+fn send(mut stream: &TcpStream, res: &Res) {
+    let result = stream
+        .write_all(res.to_string().as_bytes())
+        .and_then(|_| stream.flush());
+    if let Err(e) = result {
+        eprintln!("Error sending response: {e}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::thread;
-    use std::time::Duration;
+    use std::io::Read;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
-    #[test]
-    fn it_works() {
-        thread::spawn(|| {
-            let mut app = Sargami::new();
-            app.get("/sargam", |_| Res {
-                status_code: 200,
-                status_text: String::from("OK"),
-                headers: Vec::new(),
-                body: "hello world".to_string(),
-            });
-            app.listen("127.0.0.1:7878");
-        });
+    /// Start `app` on a free port in a background thread and return its address.
+    /// The listener is bound before the thread starts, so there is nothing to
+    /// wait for: connections made right away queue until the server accepts them.
+    fn start(app: Sargami) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || app.serve(listener));
+        addr
+    }
 
-        // Sleep to ensure server is ready
-        thread::sleep(Duration::from_millis(100));
-
-        let mut stream = TcpStream::connect("127.0.0.1:7878").unwrap();
-
-        // Send proper HTTP request with CRLF line endings
-        stream
-            .write_all(b"GET /sargam HTTP/1.1\r\nHost: 127.0.0.1:7878\r\n\r\n")
-            .unwrap();
+    /// Send a raw request and return the whole response.
+    fn exchange(addr: SocketAddr, raw: &str) -> String {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.write_all(raw.as_bytes()).unwrap();
         stream.flush().unwrap();
 
-        let mut reader = BufReader::new(&stream);
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
 
-        // Read status line
-        let mut status_line = String::new();
-        reader.read_line(&mut status_line).unwrap();
+    #[test]
+    fn routes_a_get_request() {
+        let mut app = Sargami::new();
+        app.get("/sargam", |_| Res::ok().with_body("hello world"));
+        let addr = start(app);
 
-        println!("status_line: {}", status_line);
+        let response = exchange(addr, "GET /sargam HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "got: {response}");
+        assert!(response.ends_with("\r\n\r\nhello world"), "got: {response}");
+    }
 
-        // Verify it's a 200 response
-        assert!(status_line.contains("200") || status_line.contains("HTTP"));
+    #[test]
+    fn unknown_route_is_a_404() {
+        let addr = start(Sargami::new());
+
+        let response = exchange(addr, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"), "got: {response}");
     }
 
     #[test]
     fn survives_bad_clients() {
-        thread::spawn(|| {
-            let mut app = Sargami::new();
-            app.get("/ok", |_| Res::ok().with_body("still alive".to_string()));
-            app.listen("127.0.0.1:7879");
-        });
-
-        // Sleep to ensure server is ready
-        thread::sleep(Duration::from_millis(100));
+        let mut app = Sargami::new();
+        app.get("/ok", |_| Res::ok().with_body("still alive"));
+        let addr = start(app);
 
         // A client that connects and hangs up without sending anything.
-        drop(TcpStream::connect("127.0.0.1:7879").unwrap());
+        drop(TcpStream::connect(addr).unwrap());
 
         // A request line with no HTTP version.
-        let status = exchange("GET /ok\r\n\r\n");
-        assert!(status.starts_with("HTTP/1.1 400"), "got: {status}");
+        let response = exchange(addr, "GET /ok\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
 
         // A header line with no colon.
-        let status = exchange("GET /ok HTTP/1.1\r\nnot a header\r\n\r\n");
-        assert!(status.starts_with("HTTP/1.1 400"), "got: {status}");
+        let response = exchange(addr, "GET /ok HTTP/1.1\r\nnot a header\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+
+        // A method the server does not know.
+        let response = exchange(addr, "BREW /ok HTTP/1.1\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
 
         // The server must still be alive to answer a well-formed request.
-        let status = exchange("GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(status.starts_with("HTTP/1.1 200"), "got: {status}");
-    }
-
-    /// Send a raw request to the test server on 7879 and return its status line.
-    fn exchange(raw: &str) -> String {
-        let mut stream = TcpStream::connect("127.0.0.1:7879").unwrap();
-        stream.write_all(raw.as_bytes()).unwrap();
-        stream.flush().unwrap();
-
-        let mut status_line = String::new();
-        BufReader::new(&stream).read_line(&mut status_line).unwrap();
-        status_line
+        let response = exchange(addr, "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
     }
 
     #[test]
     fn post_body_reaches_the_handler() {
-        thread::spawn(|| {
-            let mut app = Sargami::new();
-            app.post("/echo", |req| Res::ok().with_body(req.body.unwrap_or_default()));
-            app.listen("127.0.0.1:7880");
-        });
-
-        // Sleep to ensure server is ready
-        thread::sleep(Duration::from_millis(100));
+        let mut app = Sargami::new();
+        app.post("/echo", |req| Res::ok().with_body(req.body.unwrap_or_default()));
+        let addr = start(app);
 
         let request = concat!(
             "POST /echo HTTP/1.1\r\n",
@@ -235,38 +277,79 @@ mod tests {
             "\r\n",
             "hello world"
         );
-        let mut stream = TcpStream::connect("127.0.0.1:7880").unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.flush().unwrap();
-
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-
+        let response = exchange(addr, request);
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
         assert!(response.ends_with("\r\n\r\nhello world"), "got: {response}");
     }
 
     #[test]
     fn query_string_does_not_break_routing() {
-        thread::spawn(|| {
-            let mut app = Sargami::new();
-            app.get("/users", |req| {
-                Res::ok().with_body(req.get_query("id").unwrap_or("none").to_string())
-            });
-            app.listen("127.0.0.1:7881");
+        let mut app = Sargami::new();
+        app.get("/users", |req| {
+            Res::ok().with_body(req.get_query("id").unwrap_or("none").to_string())
         });
+        let addr = start(app);
 
-        // Sleep to ensure server is ready
-        thread::sleep(Duration::from_millis(100));
-
-        let mut stream = TcpStream::connect("127.0.0.1:7881").unwrap();
-        stream.write_all(b"GET /users?id=42 HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-        stream.flush().unwrap();
-
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-
+        let response = exchange(addr, "GET /users?id=42 HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
         assert!(response.ends_with("\r\n\r\n42"), "got: {response}");
+    }
+
+    #[test]
+    fn handlers_can_capture_state() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+
+        let mut app = Sargami::new();
+        app.get("/hit", move |_| {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            Res::ok().with_body(n.to_string())
+        });
+        let addr = start(app);
+
+        exchange(addr, "GET /hit HTTP/1.1\r\n\r\n");
+        exchange(addr, "GET /hit HTTP/1.1\r\n\r\n");
+        let response = exchange(addr, "GET /hit HTTP/1.1\r\n\r\n");
+
+        assert!(response.ends_with("\r\n\r\n3"), "got: {response}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn route_registration_chains() {
+        let mut app = Sargami::new();
+        app.get("/a", |_| Res::ok().with_body("a"))
+            .post("/b", |_| Res::ok().with_body("b"))
+            .route(Method::Options, "/c", |_| Res::ok());
+        let addr = start(app);
+
+        let response = exchange(addr, "POST /b HTTP/1.1\r\n\r\n");
+        assert!(response.ends_with("\r\n\r\nb"), "got: {response}");
+
+        let response = exchange(addr, "OPTIONS /c HTTP/1.1\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+    }
+
+    #[test]
+    fn handles_connections_concurrently() {
+        let mut app = Sargami::new();
+        app.get("/slow", |_| {
+            thread::sleep(Duration::from_millis(300));
+            Res::ok()
+        });
+        let addr = start(app);
+
+        let started = Instant::now();
+        let clients: Vec<_> = (0..2)
+            .map(|_| thread::spawn(move || exchange(addr, "GET /slow HTTP/1.1\r\n\r\n")))
+            .collect();
+        for client in clients {
+            let response = client.join().unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        }
+
+        // Served one after the other, two 300 ms requests would take 600 ms.
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(550), "took {elapsed:?}");
     }
 }
