@@ -9,7 +9,7 @@ mod req;
 mod res;
 
 pub use method::Method;
-pub use req::Req;
+pub use req::{ParseError, Req};
 pub use res::Res;
 
 type Handler = fn(Req) -> Res;
@@ -57,35 +57,44 @@ impl Sargami {
     }
 
     fn handle_connection(&self, mut stream: TcpStream) {
-        let buf_reader = BufReader::new(&stream);
-        let http_request = buf_reader
-            .lines()
-            .map(|result| result.unwrap())
-            .take_while(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut request_lines = Vec::new();
+        for line in BufReader::new(&stream).lines() {
+            match line {
+                Ok(line) if line.is_empty() => break,
+                Ok(line) => request_lines.push(line),
+                Err(e) => {
+                    eprintln!("Error reading request: {}", e);
+                    return;
+                }
+            }
+        }
 
-        let req = Req::new(&http_request);
+        // A client that connected and hung up without sending anything is not
+        // an error: browsers open speculative connections like this all the time.
+        if request_lines.is_empty() {
+            return;
+        }
+
+        let req = match Req::parse(&request_lines.join("\n")) {
+            Ok(req) => req,
+            Err(e) => {
+                eprintln!("Bad request: {}", e);
+                send(&mut stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                return;
+            }
+        };
 
         let method = match Method::from_str(&req.method) {
             Some(m) => m,
             None => {
-                stream
-                    .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                    .unwrap();
+                send(&mut stream, b"HTTP/1.1 400 Bad Request\r\n\r\n");
                 return;
             }
         };
 
         match self.handle_request(method, &req.path, &req) {
-            Ok(res) => {
-                let res_string = res.to_string();
-                match stream.write_all(res_string.as_bytes()) {
-                    Ok(_) => stream.flush().unwrap(),
-                    Err(e) => println!("Error sending response: {}", e),
-                }
-            }
-            Err(_) => stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap(),
+            Ok(res) => send(&mut stream, res.to_string().as_bytes()),
+            Err(_) => send(&mut stream, b"HTTP/1.1 404 Not Found\r\n\r\n"),
         }
     }
 
@@ -94,9 +103,19 @@ impl Sargami {
         println!("Listening on {}", addr);
 
         for stream in listener.incoming() {
-            let stream = stream.unwrap();
-            self.handle_connection(stream);
+            match stream {
+                Ok(stream) => self.handle_connection(stream),
+                Err(e) => eprintln!("Error accepting connection: {}", e),
+            }
         }
+    }
+}
+
+/// Write a response to the client. A client that has already hung up must not
+/// take the server down with it, so write errors are logged, not unwrapped.
+fn send(stream: &mut TcpStream, bytes: &[u8]) {
+    if let Err(e) = stream.write_all(bytes).and_then(|_| stream.flush()) {
+        eprintln!("Error sending response: {}", e);
     }
 }
 
@@ -141,5 +160,43 @@ mod tests {
 
         // Verify it's a 200 response
         assert!(status_line.contains("200") || status_line.contains("HTTP"));
+    }
+
+    #[test]
+    fn survives_bad_clients() {
+        thread::spawn(|| {
+            let mut app = Sargami::new();
+            app.get("/ok", |_| Res::ok().with_body("still alive".to_string()));
+            app.listen("127.0.0.1:7879");
+        });
+
+        // Sleep to ensure server is ready
+        thread::sleep(Duration::from_millis(100));
+
+        // A client that connects and hangs up without sending anything.
+        drop(TcpStream::connect("127.0.0.1:7879").unwrap());
+
+        // A request line with no HTTP version.
+        let status = exchange("GET /ok\r\n\r\n");
+        assert!(status.starts_with("HTTP/1.1 400"), "got: {status}");
+
+        // A header line with no colon.
+        let status = exchange("GET /ok HTTP/1.1\r\nnot a header\r\n\r\n");
+        assert!(status.starts_with("HTTP/1.1 400"), "got: {status}");
+
+        // The server must still be alive to answer a well-formed request.
+        let status = exchange("GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(status.starts_with("HTTP/1.1 200"), "got: {status}");
+    }
+
+    /// Send a raw request to the test server on 7879 and return its status line.
+    fn exchange(raw: &str) -> String {
+        let mut stream = TcpStream::connect("127.0.0.1:7879").unwrap();
+        stream.write_all(raw.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        let mut status_line = String::new();
+        BufReader::new(&stream).read_line(&mut status_line).unwrap();
+        status_line
     }
 }
