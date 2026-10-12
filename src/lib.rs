@@ -245,4 +245,28 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
         assert!(response.ends_with("\r\n\r\nhello world"), "got: {response}");
     }
+
+    #[test]
+    fn query_string_does_not_break_routing() {
+        thread::spawn(|| {
+            let mut app = Sargami::new();
+            app.get("/users", |req| {
+                Res::ok().with_body(req.get_query("id").unwrap_or("none").to_string())
+            });
+            app.listen("127.0.0.1:7881");
+        });
+
+        // Sleep to ensure server is ready
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect("127.0.0.1:7881").unwrap();
+        stream.write_all(b"GET /users?id=42 HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        assert!(response.ends_with("\r\n\r\n42"), "got: {response}");
+    }
 }

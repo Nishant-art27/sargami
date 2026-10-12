@@ -79,11 +79,16 @@ impl Req {
         let first_line = lines.next().ok_or(ParseError::Empty)?;
 
         let mut parts = first_line.split_whitespace();
-        let (method, path, version) = match (parts.next(), parts.next(), parts.next()) {
-            (Some(method), Some(path), Some(version)) => {
-                (method.to_string(), path.to_string(), version.to_string())
-            }
+        let (method, target, version) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(method), Some(target), Some(version)) => (method, target, version),
             _ => return Err(ParseError::MalformedRequestLine(first_line.to_string())),
+        };
+
+        // Everything after the first `?` is the query string, not the path, so
+        // `/users?id=1` must still match a route registered as `/users`.
+        let (path, query) = match target.split_once('?') {
+            Some((path, raw_query)) => (path, parse_query(raw_query)),
+            None => (target, HashMap::new()),
         };
 
         let mut headers = Vec::new();
@@ -98,11 +103,11 @@ impl Req {
         }
 
         Ok(Self {
-            method,
-            path,
-            version,
+            method: method.to_string(),
+            path: path.to_string(),
+            version: version.to_string(),
             headers,
-            query: HashMap::new(),
+            query,
             body: None,
         })
     }
@@ -136,10 +141,53 @@ impl Req {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Get a query parameter value by key
+    /// Get a query parameter value by key. Values are already percent-decoded.
     pub fn get_query(&self, key: &str) -> Option<&str> {
         self.query.get(key).map(|v| v.as_str())
     }
+}
+
+/// Parse `a=1&b=hello%20world` into a map. Keys and values are percent-decoded,
+/// `+` means space, a key with no `=` gets an empty value, and when a key
+/// repeats the last value wins.
+fn parse_query(raw: &str) -> HashMap<String, String> {
+    raw.split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode(key), percent_decode(value))
+        })
+        .collect()
+}
+
+/// Decode `%XX` escapes and `+` as used in URL query strings. A malformed
+/// escape such as `%zz` is passed through unchanged.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' => match decode_escape(bytes, i) {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 2; // skip the two hex digits as well as the '%'
+                }
+                None => out.push(b'%'),
+            },
+            other => out.push(other),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The byte encoded by the `%XX` escape starting at `bytes[i]`, if it is valid.
+fn decode_escape(bytes: &[u8], i: usize) -> Option<u8> {
+    let hi = (bytes.get(i + 1).copied()? as char).to_digit(16)?;
+    let lo = (bytes.get(i + 2).copied()? as char).to_digit(16)?;
+    Some((hi * 16 + lo) as u8)
 }
 
 #[cfg(test)]
@@ -212,5 +260,33 @@ mod tests {
         let mut req = Req::parse("POST / HTTP/1.1\nContent-Length: 10").unwrap();
         let err = req.read_body(&mut Cursor::new(&b"short"[..])).unwrap_err();
         assert!(matches!(err, BodyError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn splits_query_string_off_the_path() {
+        let req = Req::parse("GET /users?id=7&name=Ada+Lovelace&tag=a%2Cb HTTP/1.1").unwrap();
+        assert_eq!(req.path, "/users");
+        assert_eq!(req.get_query("id"), Some("7"));
+        assert_eq!(req.get_query("name"), Some("Ada Lovelace"));
+        assert_eq!(req.get_query("tag"), Some("a,b"));
+        assert_eq!(req.get_query("missing"), None);
+    }
+
+    #[test]
+    fn query_edge_cases() {
+        let req = Req::parse("GET /p?flag&empty=&a=1&a=2&&x=%zz HTTP/1.1").unwrap();
+        assert_eq!(req.path, "/p");
+        assert_eq!(req.get_query("flag"), Some(""));
+        assert_eq!(req.get_query("empty"), Some(""));
+        assert_eq!(req.get_query("a"), Some("2"));
+        assert_eq!(req.get_query("x"), Some("%zz"));
+        assert_eq!(req.query.len(), 4);
+    }
+
+    #[test]
+    fn path_without_query_has_empty_query_map() {
+        let req = Req::parse("GET /plain HTTP/1.1").unwrap();
+        assert_eq!(req.path, "/plain");
+        assert!(req.query.is_empty());
     }
 }
