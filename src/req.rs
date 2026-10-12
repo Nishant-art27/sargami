@@ -47,7 +47,10 @@ impl fmt::Display for BodyError {
         match self {
             BodyError::BadContentLength(raw) => write!(f, "invalid Content-Length: {raw:?}"),
             BodyError::TooLarge(len) => {
-                write!(f, "body of {len} bytes exceeds the {MAX_BODY_SIZE} byte limit")
+                write!(
+                    f,
+                    "body of {len} bytes exceeds the {MAX_BODY_SIZE} byte limit"
+                )
             }
             BodyError::Io(e) => write!(f, "could not read body: {e}"),
         }
@@ -229,7 +232,8 @@ mod tests {
     #[test]
     fn reads_exactly_content_length_bytes() {
         let mut req = Req::parse("POST / HTTP/1.1\nContent-Length: 5").unwrap();
-        req.read_body(&mut Cursor::new(&b"hello, and more"[..])).unwrap();
+        req.read_body(&mut Cursor::new(&b"hello, and more"[..]))
+            .unwrap();
         assert_eq!(req.body.as_deref(), Some("hello"));
     }
 

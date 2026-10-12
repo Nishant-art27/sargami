@@ -226,7 +226,10 @@ mod tests {
         let addr = start(app);
 
         let response = exchange(addr, "GET /sargam HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "got: {response}");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "got: {response}"
+        );
         assert!(response.ends_with("\r\n\r\nhello world"), "got: {response}");
     }
 
@@ -235,7 +238,10 @@ mod tests {
         let addr = start(Sargami::new());
 
         let response = exchange(addr, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"), "got: {response}");
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "got: {response}"
+        );
     }
 
     #[test]
@@ -267,7 +273,9 @@ mod tests {
     #[test]
     fn post_body_reaches_the_handler() {
         let mut app = Sargami::new();
-        app.post("/echo", |req| Res::ok().with_body(req.body.unwrap_or_default()));
+        app.post("/echo", |req| {
+            Res::ok().with_body(req.body.unwrap_or_default())
+        });
         let addr = start(app);
 
         let request = concat!(

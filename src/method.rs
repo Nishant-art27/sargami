@@ -85,6 +85,9 @@ mod tests {
 
     #[test]
     fn unknown_method_is_an_error() {
-        assert_eq!("BREW".parse::<Method>(), Err(UnknownMethod("BREW".to_string())));
+        assert_eq!(
+            "BREW".parse::<Method>(),
+            Err(UnknownMethod("BREW".to_string()))
+        );
     }
 }
